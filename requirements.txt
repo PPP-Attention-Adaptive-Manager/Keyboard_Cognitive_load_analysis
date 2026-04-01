@@ -1,0 +1,7 @@
+pandas
+tqdm
+scikit-learn
+matplotlib
+seaborn
+pynput
+tkinter
