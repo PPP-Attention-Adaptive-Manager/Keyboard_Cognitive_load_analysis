@@ -197,7 +197,7 @@ python Data_processing.py
 **Target Variable (Proxy Formula)**:
 The target is a complex, non-linear mathematical formula that encodes cognitive load principles:
 
-$$\text{CogLoad} = 0.3 \cdot \ln(1 + \text{Hold} \cdot \text{Pause}) + 0.2 \cdot \text{Max\_Hold} + 0.2 \cdot \text{Pause\_Per\_Min}^{1.5} + \ldots$$
+$\text{CogLoad} = 0.3 \cdot \ln(1 + \text{Hold} \cdot \text{Pause}) + 0.2 \cdot \text{Max\_Hold} + 0.2 \cdot \text{Pause\_Per\_Min}^{1.5} + \ldots$
 
 This formula combines multiple typing metrics into a single cognitive load score (range: 0-10).
 
