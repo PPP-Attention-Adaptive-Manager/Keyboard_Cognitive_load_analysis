@@ -1,0 +1,36 @@
+{
+  "best_model": "hgb",
+  "dataset": "D:\\files\\PPP\\github repo (linux)\\Keyboard_Cognitive_load_analysis\\V2\\fully_labeled_cognitive_dataset.csv",
+  "description": "Predicts cognitive_label (cluster id) from engineered per-keystroke features.",
+  "eval": {
+    "max_samples": 200000,
+    "metrics_best_row": {
+      "accuracy": 0.8756430986329561,
+      "balanced_accuracy": 0.7099270691525611,
+      "f1_macro": 0.7353697249478127,
+      "f1_weighted": 0.8672601148633613,
+      "model": "hgb"
+    },
+    "random_state": 42,
+    "test_size": 0.2
+  },
+  "features": [
+    "IKT",
+    "dwell_time",
+    "typing_speed",
+    "burstiness",
+    "ikt_mean_5",
+    "dwell_mean_5",
+    "dwell_std_5",
+    "is_alpha",
+    "is_digit",
+    "is_space",
+    "is_punct",
+    "is_backspace",
+    "keycode_norm",
+    "activity_density"
+  ],
+  "group_col": "PARTICIPANT_ID",
+  "target": "cognitive_label",
+  "task": "classification"
+}

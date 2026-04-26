@@ -1,0 +1,35 @@
+{
+  "best_model": "hgb",
+  "dataset": "D:\\files\\PPP\\github repo (linux)\\Keyboard_Cognitive_load_analysis\\V2\\fully_labeled_cognitive_dataset.csv",
+  "description": "Predicts cognitive_risk (0..1) from engineered per-keystroke features.",
+  "eval": {
+    "max_samples": 200000,
+    "metrics_best_row": {
+      "mae": 0.06197097285100224,
+      "model": "hgb",
+      "r2": 0.4788401299218097,
+      "rmse": 0.0782213227858129
+    },
+    "random_state": 42,
+    "test_size": 0.2
+  },
+  "features": [
+    "IKT",
+    "dwell_time",
+    "typing_speed",
+    "burstiness",
+    "ikt_mean_5",
+    "dwell_mean_5",
+    "dwell_std_5",
+    "is_alpha",
+    "is_digit",
+    "is_space",
+    "is_punct",
+    "is_backspace",
+    "keycode_norm",
+    "activity_density"
+  ],
+  "group_col": "PARTICIPANT_ID",
+  "target": "cognitive_risk",
+  "task": "regression"
+}

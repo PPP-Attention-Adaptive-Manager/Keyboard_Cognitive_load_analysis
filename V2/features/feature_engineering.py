@@ -4,119 +4,221 @@ from numba import njit
 from joblib import Parallel, delayed
 import multiprocessing
 
+
 # ==========================================================
-# 1. MEMORY-EFFICIENT LEVENSHTEIN (O(N) Space)
+# ENTROPY
+# ==========================================================
+def entropy(series):
+    p = series.value_counts(normalize=True)
+    return -(p * np.log2(p + 1e-9)).sum()
+
+
+# ==========================================================
+# LEVENSHTEIN (FAST)
 # ==========================================================
 @njit(cache=True)
 def levenshtein_fast(s1, s2):
-    """Iterative Levenshtein with only two rows of memory."""
     if len(s1) < len(s2):
         s1, s2 = s2, s1
 
     if len(s2) == 0:
         return len(s1)
 
-    previous_row = np.arange(len(s2) + 1, dtype=np.int32)
+    prev = np.arange(len(s2) + 1, dtype=np.int32)
+
     for i, c1 in enumerate(s1):
-        current_row = np.zeros(len(s2) + 1, dtype=np.int32)
-        current_row[0] = i + 1
+        curr = np.zeros(len(s2) + 1, dtype=np.int32)
+        curr[0] = i + 1
+
         for j, c2 in enumerate(s2):
-            insertions = previous_row[j + 1] + 1
-            deletions = current_row[j] + 1
-            substitutions = previous_row[j] + (c1 != c2)
-            current_row[j + 1] = min(insertions, deletions, substitutions)
-        previous_row = current_row
+            ins = prev[j + 1] + 1
+            dele = curr[j] + 1
+            sub = prev[j] + (c1 != c2)
+            curr[j + 1] = min(ins, dele, sub)
 
-    return previous_row[-1]
+        prev = curr
+
+    return prev[-1]
+
 
 # ==========================================================
-# 2. OPTIMIZED PARALLEL WRAPPER
+# ERROR COMPUTATION
 # ==========================================================
-def compute_levenshtein_batch(pairs):
-    """Processes a list of (str, str) tuples."""
-    results = []
-    for s1, s2 in pairs:
-        results.append(levenshtein_fast(s1, s2))
-    return results
+def compute_error(df):
 
-def compute_sentence_error_optimized(df):
-    # Only get the final state of USER_INPUT for each group to avoid redundant work
-    # Grouping by ID and SENTENCE, then taking the last input
-    grouped_df = df.groupby(["PARTICIPANT_ID", "TEST_SECTION_ID", "SENTENCE"], sort=False)["USER_INPUT"].last().reset_index()
-    
-    # --- CRITICAL OPTIMIZATION: Compute only UNIQUE string pairs ---
-    # In many datasets, the same sentence or input appears multiple times.
-    unique_pairs = grouped_df[["SENTENCE", "USER_INPUT"]].drop_duplicates().copy()
-    
-    # Prepare data for parallel processing (lists of strings are fast to serialize)
-    tasks = list(zip(unique_pairs["SENTENCE"].values, unique_pairs["USER_INPUT"].values))
-    
+    grouped = df.groupby(
+        ["PARTICIPANT_ID", "TEST_SECTION_ID", "SENTENCE"]
+    )["USER_INPUT"].last().reset_index()
+
+    unique = grouped[["SENTENCE", "USER_INPUT"]].drop_duplicates()
+
+    tasks = list(zip(unique["SENTENCE"], unique["USER_INPUT"]))
+
     n_cores = multiprocessing.cpu_count()
-    # Chunk the tasks to reduce parallel overhead
     chunks = np.array_split(tasks, n_cores)
-    
-    print(f"🚀 Computing {len(tasks)} unique Levenshtein pairs on {n_cores} cores...")
-    
-    flat_results = Parallel(n_jobs=n_cores, backend="loky")(
-        delayed(compute_levenshtein_batch)(chunk) for chunk in chunks
+
+    def worker(chunk):
+        return [levenshtein_fast(a, b) for a, b in chunk]
+
+    results = Parallel(n_jobs=n_cores, backend="loky")(
+        delayed(worker)(chunk) for chunk in chunks
     )
-    
-    # Flatten results and map back to unique pairs
-    unique_pairs["ERROR_RATE_ML"] = [item for sublist in flat_results for item in sublist]
-    
-    # Merge the distances back to the grouped_df
-    result_df = grouped_df.merge(unique_pairs, on=["SENTENCE", "USER_INPUT"], how="left")
-    
-    return result_df[["PARTICIPANT_ID", "TEST_SECTION_ID", "SENTENCE", "ERROR_RATE_ML"]]
+
+    flat = [x for sub in results for x in sub]
+    unique["ERROR_RATE_ML"] = flat
+
+    return grouped.merge(unique, on=["SENTENCE", "USER_INPUT"], how="left")
+
 
 # ==========================================================
-# 3. FAST FEATURE ENGINEERING
+# MAIN FEATURE ENGINEERING
 # ==========================================================
-def build_features(df: pd.DataFrame, min_pause=1000) -> pd.DataFrame:
+def build_features(df: pd.DataFrame):
+
     df = df.copy()
 
-    # Numeric safety (Vectorized)
+    # ==========================================================
+    # CLEAN
+    # ==========================================================
     for col in ["PRESS_TIME", "RELEASE_TIME", "KEYCODE"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df = df.dropna(subset=["PRESS_TIME", "RELEASE_TIME"])
 
-    # Temporal features
-    df["IKI"] = df.groupby(["PARTICIPANT_ID", "TEST_SECTION_ID"])["PRESS_TIME"].diff().fillna(0).clip(lower=0)
-    df["HOLD_TIME"] = (df["RELEASE_TIME"] - df["PRESS_TIME"]).clip(lower=0)
-    
-    # Pre-calculate flags to avoid slow lambdas in .agg()
-    df["IS_BACKSPACE"] = df["KEYCODE"].isin([8, 46]).astype(int)
-    df["IS_LONG_PAUSE"] = (df["IKI"] > min_pause).astype(int)
-
-    # String safety
     df["SENTENCE"] = df["SENTENCE"].fillna("").astype(str)
     df["USER_INPUT"] = df["USER_INPUT"].fillna("").astype(str)
-    df["SENTENCE_LENGTH"] = df["SENTENCE"].str.len()
 
-    # Compute ML error
-    error_df = compute_sentence_error_optimized(df)
+    # ==========================================================
+    # ERROR (INSIDE FEATURE ENGINEERING)
+    # ==========================================================
+    err = compute_error(df)
 
-    # Merge distances back to main df
-    df = df.merge(error_df, on=["PARTICIPANT_ID", "TEST_SECTION_ID", "SENTENCE"], how="left")
-
-    # Aggregation (Removed slow lambdas)
-    session_features = df.groupby(["PARTICIPANT_ID", "TEST_SECTION_ID"]).agg(
-        MEAN_IKI=("IKI", "mean"),
-        MEDIAN_IKI=("IKI", "median"),
-        STD_IKI=("IKI", "std"),
-        LONG_PAUSE_COUNT=("IS_LONG_PAUSE", "sum"),
-        PAUSE_RATIO=("IS_LONG_PAUSE", "mean"),
-        MEAN_HOLD_TIME=("HOLD_TIME", "mean"),
-        MAX_HOLD_TIME=("HOLD_TIME", "max"),
-        TOTAL_KEYSTROKES=("PRESS_TIME", "count"),
-        BACKSPACE_COUNT=("IS_BACKSPACE", "sum"),
-        MEAN_ERROR_RATE_ML=("ERROR_RATE_ML", "mean"),
-        MEAN_SENTENCE_LENGTH=("SENTENCE_LENGTH", "mean")
+    df = df.merge(
+        err,
+        on=["PARTICIPANT_ID", "TEST_SECTION_ID", "SENTENCE"],
+        how="left"
     )
 
-    # Post-aggregation math (Faster than lambda)
-    session_features["IKI_CV"] = session_features["STD_IKI"] / (session_features["MEAN_IKI"] + 1e-9)
-    session_features["BACKSPACE_RATIO"] = session_features["BACKSPACE_COUNT"] / (session_features["TOTAL_KEYSTROKES"] + 1e-9)
-    session_features["KSPC_PROXY"] = session_features["TOTAL_KEYSTROKES"] / (session_features["MEAN_SENTENCE_LENGTH"] + 1e-9)
+    df["ERROR_RATE_ML"] = df["ERROR_RATE_ML"].fillna(0)
 
-    return session_features.reset_index().fillna(0)
+    # ==========================================================
+    # IKI + HOLD
+    # ==========================================================
+    df["IKI"] = df.groupby(
+        ["PARTICIPANT_ID", "TEST_SECTION_ID"]
+    )["PRESS_TIME"].diff().fillna(0).clip(lower=0)
+
+    df["HOLD_TIME"] = (df["RELEASE_TIME"] - df["PRESS_TIME"]).clip(lower=0)
+
+    # ==========================================================
+    # KEYS
+    # ==========================================================
+    df["IS_BACKSPACE"] = df["KEYCODE"].isin([8, 46]).astype(int)
+
+    total_keys = df.groupby(
+        ["PARTICIPANT_ID", "TEST_SECTION_ID"]
+    )["PRESS_TIME"].transform("count")
+
+    # ==========================================================
+    # KSPC FAMILY
+    # ==========================================================
+    sentence_len = df["SENTENCE"].str.len().replace(0, np.nan)
+
+    df["KSPC"] = total_keys / (sentence_len + 1e-9)
+    df["KSPC_WORD"] = total_keys / (df["SENTENCE"].str.split().str.len() + 1e-9)
+
+    # ==========================================================
+    # WORD FEATURES
+    # ==========================================================
+    words = df["SENTENCE"].str.split()
+
+    df["WORD_COUNT"] = words.str.len()
+
+    df["WORD_LENGTHS"] = words.apply(
+        lambda x: [len(w) for w in x] if isinstance(x, list) else []
+    )
+
+    df["WORD_AVG_LEN"] = df["WORD_LENGTHS"].apply(lambda x: np.mean(x) if len(x) else 0)
+    df["WORD_STD_LEN"] = df["WORD_LENGTHS"].apply(lambda x: np.std(x) if len(x) else 0)
+
+    for i in range(1, 12):
+        df[f"WORD_LEN_{i}"] = df["WORD_LENGTHS"].apply(
+            lambda x: sum(1 for w in x if len(w) == i)
+        )
+
+    # ==========================================================
+    # DIGRAPH FEATURES
+    # ==========================================================
+    df["DOUBLE_KEY"] = (df["KEYCODE"] == df["KEYCODE"].shift()).astype(int)
+
+    df["DIGRAPH_TIME"] = df.groupby(
+        ["PARTICIPANT_ID", "TEST_SECTION_ID"]
+    )["PRESS_TIME"].diff().fillna(0).clip(lower=0)
+
+    # ==========================================================
+    # SESSION AGGREGATION
+    # ==========================================================
+    session = df.groupby(
+        ["PARTICIPANT_ID", "TEST_SECTION_ID"]
+    ).agg(
+
+        # ---------------- IKI ----------------
+        MEAN_IKI=("IKI", "mean"),
+        STD_IKI=("IKI", "std"),
+        MEDIAN_IKI=("IKI", "median"),
+        MAX_IKI=("IKI", "max"),
+
+        # ---------------- HOLD ----------------
+        MEAN_HOLD=("HOLD_TIME", "mean"),
+
+        # ---------------- KSPC ----------------
+        MEAN_KSPC=("KSPC", "mean"),
+        MEAN_KSPC_WORD=("KSPC_WORD", "mean"),
+
+        # ---------------- WORD ----------------
+        WORD_COUNT=("WORD_COUNT", "mean"),
+        WORD_AVG_LEN=("WORD_AVG_LEN", "mean"),
+        WORD_STD_LEN=("WORD_STD_LEN", "mean"),
+
+        # ---------------- ERROR ----------------
+        ERROR_RATE=("ERROR_RATE_ML", "mean"),
+
+        # ---------------- CORRECTION ----------------
+        BACKSPACE=("IS_BACKSPACE", "sum"),
+
+        # ---------------- DIGRAPH ----------------
+        DOUBLE_KEY_RATE=("DOUBLE_KEY", "mean"),
+        MEAN_DIGRAPH=("DIGRAPH_TIME", "mean"),
+        STD_DIGRAPH=("DIGRAPH_TIME", "std"),
+
+        # ---------------- GLOBAL ----------------
+        TOTAL_KEYS=("PRESS_TIME", "count"),
+    )
+
+    # ==========================================================
+    # DERIVED FEATURES
+    # ==========================================================
+    session["IKI_CV"] = session["STD_IKI"] / (session["MEAN_IKI"] + 1e-9)
+
+    session["IKI_RANGE"] = session["MAX_IKI"] - session["MEAN_IKI"]
+
+    session["BACKSPACE_RATIO"] = session["BACKSPACE"] / (session["TOTAL_KEYS"] + 1e-9)
+
+    session["DIGRAPH_CV"] = session["STD_DIGRAPH"] / (session["MEAN_DIGRAPH"] + 1e-9)
+
+    session["KEY_ENTROPY"] = df.groupby(
+        ["PARTICIPANT_ID", "TEST_SECTION_ID"]
+    )["KEYCODE"].apply(entropy).values
+
+    session["EFFORT_INDEX"] = (
+        session["ERROR_RATE"] +
+        session["BACKSPACE_RATIO"] +
+        session["IKI_CV"]
+    ) / 3
+
+    session["COGNITIVE_LOAD_PROXY"] = (
+        session["EFFORT_INDEX"] +
+        session["MEAN_KSPC"]
+    ) / 2
+
+    return session.reset_index().fillna(0)

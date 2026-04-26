@@ -2,260 +2,151 @@ import pandas as pd
 import numpy as np
 import joblib
 import logging
-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
+
+# ==========================================================
+# CUDA / DEVICE CONFIG
+# ==========================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+log_gpu = f"🚀 Using Device: {device}"
+if device.type == 'cuda':
+    log_gpu += f" ({torch.cuda.get_device_name(0)})"
 
 # ==========================================================
 # CONFIG
 # ==========================================================
-
 INPUT_PATH = "data/processed/session_features.csv"
-MODEL_PATH = "models/behavior_model.pkl"
+MODEL_PATH = "models/behavior_model.pth" # Changed extension for PyTorch
 
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
-
-N_TREES = 300
-BATCH_SIZE = 10
-
-MIN_FEATURES = 5
-MAX_FEATURES = 6  # 4–5 + mandatory ones
-
+EPOCHS = 100
+BATCH_SIZE = 128
+LEARNING_RATE = 0.001
+MAX_FEATURES = 6
 
 # ==========================================================
 # LOGGING
 # ==========================================================
-
 logging.basicConfig(level=logging.INFO, format="🧠 %(message)s")
 log = logging.getLogger()
-
+log.info(log_gpu)
 
 # ==========================================================
-# LOAD DATA
+# LOAD & CLEAN DATA
 # ==========================================================
-
 log.info("Loading dataset...")
-df = pd.read_csv(INPUT_PATH)
-
-log.info(f"Shape: {df.shape}")
-log.info(f"Users: {df['PARTICIPANT_ID'].nunique()}")
-log.info(f"Sessions: {df['TEST_SECTION_ID'].nunique()}")
-
-
-# ==========================================================
-# BASE FEATURES (CANDIDATES)
-# ==========================================================
+df = pd.read_csv(INPUT_PATH).replace([np.inf, -np.inf], np.nan)
 
 CANDIDATE_FEATURES = [
-    "MEAN_IKI",
-    "MEDIAN_IKI",
-    "IKI_CV",
-    "LONG_PAUSE_COUNT",
-    "PAUSE_RATIO",
-    "MEAN_HOLD_TIME",
-    "MAX_HOLD_TIME",
-    "TOTAL_KEYSTROKES",
-    "BACKSPACE_COUNT",
-    "BACKSPACE_RATIO",
-    "MEAN_ERROR_RATE_ML",
-    "MEAN_SENTENCE_LENGTH",
-    "KSPC_PROXY",
+    "MEAN_IKI", "MEDIAN_IKI", "IKI_CV", "LONG_PAUSE_COUNT",
+    "PAUSE_RATIO", "MEAN_HOLD_TIME", "MAX_HOLD_TIME",
+    "TOTAL_KEYSTROKES", "BACKSPACE_COUNT", "BACKSPACE_RATIO",
+    "MEAN_ERROR_RATE_ML", "MEAN_SENTENCE_LENGTH", "KSPC_PROXY",
 ]
-
-
-MANDATORY_FEATURES = [
-    "BACKSPACE_RATIO",
-    "MEAN_ERROR_RATE_ML",
-]
-
-
-TARGETS = [
-    "COGLOAD_PROXY",
-    "STRESS_PROXY",
-    "UNFOCUS_PROXY"
-]
-
-
-# ==========================================================
-# CLEAN DATA
-# ==========================================================
-
-log.info("Cleaning data...")
-
-df = df.replace([np.inf, -np.inf], np.nan)
-
-missing_features = set(CANDIDATE_FEATURES + TARGETS) - set(df.columns)
-if missing_features:
-    raise ValueError(f"Missing columns: {missing_features}")
+MANDATORY_FEATURES = ["BACKSPACE_RATIO", "MEAN_ERROR_RATE_ML"]
+TARGETS = ["COGLOAD_PROXY", "STRESS_PROXY", "UNFOCUS_PROXY"]
 
 df = df.dropna(subset=TARGETS)
 
-
-# ==========================================================
-# CORRELATION FILTER (KEY PART)
-# ==========================================================
-
-def select_least_correlated_features(df, features, k=4):
-    """
-    Greedy selection:
-    - start from least correlated feature set
-    - ensure diversity
-    """
-
+# Feature Selection
+def select_features(df, features, k=5):
     corr = df[features].corr().abs()
-
-    selected = []
-
-    # always include most important mandatory ones first
-    for f in MANDATORY_FEATURES:
-        if f in features:
-            selected.append(f)
-
+    selected = list(set(MANDATORY_FEATURES) & set(features))
     remaining = [f for f in features if f not in selected]
-
-    pbar = tqdm(total=k, desc="🧠 Selecting features")
-
     while len(selected) < k and remaining:
-
-        best_feature = None
-        best_score = -1
-
-        for f in remaining:
-
-            if len(selected) == 0:
-                score = df[f].std()
-            else:
-                score = 1 - corr.loc[f, selected].mean()
-
-            if score > best_score:
-                best_score = score
-                best_feature = f
-
-        selected.append(best_feature)
-        remaining.remove(best_feature)
-
-        pbar.update(1)
-
-    pbar.close()
-
+        scores = {f: (1 - corr.loc[f, selected].mean() if selected else 1) for f in remaining}
+        best_f = max(scores, key=scores.get)
+        selected.append(best_f)
+        remaining.remove(best_f)
     return selected
 
+SELECTED_FEATURES = select_features(df, CANDIDATE_FEATURES, k=MAX_FEATURES)
+log.info(f"Features: {SELECTED_FEATURES}")
+
+# Normalize and Convert to Tensors
+X = df[SELECTED_FEATURES].fillna(0).values.astype(np.float32)
+y = df[TARGETS].values.astype(np.float32)
+
+X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-9)
+y = (y - y.mean(axis=0)) / (y.std(axis=0) + 1e-9)
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+
+train_dataset = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 # ==========================================================
-# FEATURE SELECTION
+# MODEL DEFINITION (PyTorch)
 # ==========================================================
+class BehaviorNet(nn.Module):
+    def __init__(self, input_size, output_size):
+        super(BehaviorNet, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_size, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, output_size)
+        )
 
-log.info("Selecting non-correlated features...")
+    def forward(self, x):
+        return self.net(x)
 
-SELECTED_FEATURES = select_least_correlated_features(
-    df,
-    CANDIDATE_FEATURES,
-    k=MAX_FEATURES
-)
-
-log.info(f"Selected features: {SELECTED_FEATURES}")
-
-
-# ==========================================================
-# PREPARE X / Y
-# ==========================================================
-
-X = df[SELECTED_FEATURES].fillna(0)
-y = df[TARGETS].copy()
-
-# align safely
-mask = ~y.isna().any(axis=1)
-X = X.loc[mask]
-y = y.loc[mask]
-
-# normalize targets
-y = (y - y.mean()) / (y.std() + 1e-9)
-
+model = BehaviorNet(len(SELECTED_FEATURES), len(TARGETS)).to(device)
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 # ==========================================================
-# TRAIN / TEST SPLIT
+# TRAINING LOOP
 # ==========================================================
+log.info("Starting PyTorch CUDA training...")
+model.train()
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=TEST_SIZE,
-    random_state=RANDOM_STATE
-)
-
-log.info(f"Train: {X_train.shape}, Test: {X_test.shape}")
-
-
-# ==========================================================
-# MODEL (warm-start + batch trees)
-# ==========================================================
-
-model = RandomForestRegressor(
-    n_estimators=BATCH_SIZE,
-    warm_start=True,
-    max_depth=14,
-    random_state=RANDOM_STATE,
-    n_jobs=-1
-)
-
-
-# ==========================================================
-# TRAINING WITH PROGRESS BAR
-# ==========================================================
-
-log.info("Training model...")
-
-pbar = tqdm(total=N_TREES, desc="🌲 Trees")
-
-for i in range(BATCH_SIZE, N_TREES + 1, BATCH_SIZE):
-
-    model.set_params(n_estimators=i)
-    model.fit(X_train, y_train)
-
-    pbar.update(BATCH_SIZE)
-
+pbar = tqdm(total=EPOCHS, desc="🔥 CUDA Epochs")
+for epoch in range(EPOCHS):
+    epoch_loss = 0
+    for batch_X, batch_y in train_loader:
+        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(batch_X)
+        loss = criterion(outputs, batch_y)
+        loss.backward()
+        optimizer.step()
+        
+        epoch_loss += loss.item()
+    
+    pbar.update(1)
+    pbar.set_postfix({"Loss": f"{epoch_loss/len(train_loader):.4f}"})
 pbar.close()
-
 
 # ==========================================================
 # EVALUATION
 # ==========================================================
-
-score = model.score(X_test, y_test)
-log.info(f"R² score: {score:.4f}")
-
-
-# ==========================================================
-# FEATURE IMPORTANCE
-# ==========================================================
-
-importance = model.feature_importances_
-
-importance_df = pd.DataFrame({
-    "feature": SELECTED_FEATURES,
-    "importance": importance
-}).sort_values("importance", ascending=False)
-
-log.info("Feature importance:")
-
-total = importance_df["importance"].sum()
-
-for _, row in importance_df.iterrows():
-    log.info(f"{row['feature']:<25} → {100*row['importance']/total:.2f}%")
-
+model.eval()
+with torch.no_grad():
+    X_test_tensor = torch.from_numpy(X_test).to(device)
+    y_test_tensor = torch.from_numpy(y_test).to(device)
+    preds = model(X_test_tensor)
+    test_loss = criterion(preds, y_test_tensor)
+    log.info(f"Final Test MSE: {test_loss.item():.4f}")
 
 # ==========================================================
 # SAVE MODEL
 # ==========================================================
-
-joblib.dump({
-    "model": model,
-    "features": SELECTED_FEATURES,
-    "targets": TARGETS,
-    "importance": importance_df
+# We save the state dict and the feature metadata
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'features': SELECTED_FEATURES,
+    'targets': TARGETS
 }, MODEL_PATH)
 
-log.info(f"Saved → {MODEL_PATH}")
+log.info(f"Saved model to {MODEL_PATH}")
 log.info("Done ✔")
