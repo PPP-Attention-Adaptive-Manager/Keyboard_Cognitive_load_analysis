@@ -27,7 +27,8 @@ from sklearn.metrics import (
 # CONFIG
 # ============================================================
 
-DATA_PATH = Path("fully_labeled_cognitive_dataset.csv")
+V2_DIR = Path(__file__).resolve().parents[1]
+DATA_PATH = V2_DIR / "fully_labeled_cognitive_dataset.csv"
 
 GROUP_COL = "PARTICIPANT_ID"
 LABEL_COL = "cognitive_label"
